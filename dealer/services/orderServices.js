@@ -77,7 +77,7 @@ class OrderServices {
   }
 
 
-async fetchOrders(body, tokenDetails) {
+  async fetchOrders(body, tokenDetails) {
     try {
       const { id } = tokenDetails;
       const { search, orderStatus, limit, currentPage, startDate, endDate } = body
@@ -87,12 +87,12 @@ async fetchOrders(body, tokenDetails) {
 
       // Base query with dealerId
       let baseQuery = { dealerId: id };
-      
+
       // Add orderStatus filter if not "all"
       if (orderStatus !== "all") {
         baseQuery.orderStatus = orderStatus;
       }
-      
+
       // Add date range filter if both startDate and endDate are provided
       if (startDate && endDate) {
         baseQuery.createdAt = {
@@ -156,7 +156,7 @@ async fetchOrders(body, tokenDetails) {
       // Get orders with populate
       const response = await OrdersModel
         .find(findQuery)
-        .select({ orderDetails: 1, orderStatus: 1, createdAt: 1, updatedAt: 1, payments: 1,customerMobile:1,calculatedFare:1})
+        .select({ orderDetails: 1, orderStatus: 1, createdAt: 1, updatedAt: 1, payments: 1, customerMobile: 1, calculatedFare: 1 })
         .skip(skip)
         .limit(limit)
         .sort({ createdAt: -1 })
@@ -236,15 +236,17 @@ async fetchOrders(body, tokenDetails) {
         calculatedAs = "retail",
         orderDetails,
         payments = [],
+        customerName,
         customerMobile
       } = body;
+
 
       // Validate required fields
       const validatorResponse = validator.validate(['orderId'], body);
       if (validatorResponse != null) throw validatorResponse;
 
       // Validate orderStatus if provided
-      const validStatuses = ["onrequest", "ongoing", "rejected", "completed", "returned"];
+      const validStatuses = ["onrequest", "ongoing", "oncredit", "rejected", "completed", "returned"];
       if (orderStatus && !validStatuses.includes(orderStatus)) {
         throw new Error(`Invalid order status. Must be one of: ${validStatuses.join(', ')}`);
       }
@@ -257,16 +259,97 @@ async fetchOrders(body, tokenDetails) {
 
       // Check if order exists
       const existingOrder = await OrdersModel.findById(orderId);
+
+      if (existingOrder.orderStatus == "completed" || existingOrder.orderStatus == "rejected" || existingOrder.orderStatus == "returned") {
+        throw "Order status cannot be updated from completed,rejected or returned";
+      }
+
       if (!existingOrder) {
         throw new Error("Order not found");
       }
 
+      // Define statuses that require stock deduction
+      const STOCK_DEDUCT_STATUSES = ["completed", "oncredit"];
+
+      // Helper function to check if status requires stock deduction
+      const requiresStockDeduction = (status) => {
+        return STOCK_DEDUCT_STATUSES.includes(status);
+      };
+
       // Prepare update object
       const updateData = {};
 
-      // Update order status if provided
-      if (orderStatus) {
+      // Track stock changes for inventory
+      let stockChanges = [];
+
+      // Helper function to update stock (to be implemented with transaction)
+      const updateStock = async (inventoryId, quantity, operation) => {
+
+        const inventory = await DealerInventoryModel.findById(inventoryId);
+        if (!inventory) {
+          throw new Error(`Inventory with id ${inventoryId} not found`);
+        }
+
+        if (operation === 'decrement') {
+          if (inventory.stock < quantity) {
+            throw new Error(`Insufficient stock for inventory ${inventoryId}. Available: ${inventory.stock}, Required: ${quantity}`);
+          }
+          inventory.stock -= quantity;
+        } else if (operation === 'increment') {
+          inventory.stock += quantity;
+        }
+
+        await inventory.save();
+        return inventory;
+      };
+
+      // Get current and new status
+      const oldStatus = existingOrder.orderStatus;
+      const newStatus = orderStatus || oldStatus;
+      const oldRequiresStock = requiresStockDeduction(oldStatus);
+      const newRequiresStock = requiresStockDeduction(newStatus);
+
+      console.log(`Status transition: ${oldStatus} (stock: ${oldRequiresStock}) -> ${newStatus} (stock: ${newRequiresStock})`);
+
+      // Handle stock changes based on status transition
+      if (orderStatus && oldStatus !== newStatus) {
         updateData.orderStatus = orderStatus;
+
+        // Case 1: Moving to stock-deducted status from non-stock-deducted status
+        if (newRequiresStock && !oldRequiresStock) {
+          console.log("Deducting stock - moving to stock-deducted status");
+          // Deduct stock for all items in the order
+          for (const item of existingOrder.orderDetails) {
+            if (item.inventoryId) {
+              stockChanges.push({
+                inventoryId: item.inventoryId.toString(),
+                quantity: item.count,
+                operation: 'decrement'
+              });
+            }
+          }
+        }
+
+        // Case 2: Moving from stock-deducted status to non-stock-deducted status
+        else if (!newRequiresStock && oldRequiresStock) {
+          console.log("Restoring stock - moving from stock-deducted status");
+          // Restore stock for all items
+          for (const item of existingOrder.orderDetails) {
+            if (item.inventoryId) {
+              stockChanges.push({
+                inventoryId: item.inventoryId.toString(),
+                quantity: item.count,
+                operation: 'increment'
+              });
+            }
+          }
+        }
+
+        // Case 3: Moving between stock-deducted statuses (oncredit <-> completed)
+        else if (newRequiresStock && oldRequiresStock) {
+          console.log("No stock change - moving between stock-deducted statuses");
+          // No stock change needed as stock is already deducted
+        }
       }
 
       // Update calculation type if provided
@@ -274,12 +357,22 @@ async fetchOrders(body, tokenDetails) {
         updateData.calculatedAs = calculatedAs;
       }
 
+      if (customerName) {
+        updateData.customerName = customerName;
+      }
+
       if (customerMobile) {
         updateData.customerMobile = customerMobile;
       }
 
-      // Update order details if provided
+      // Track old items for stock adjustment when items change
+      let oldOrderDetails = [];
+      const shouldTrackStock = requiresStockDeduction(newStatus);
+
       if (orderDetails && Array.isArray(orderDetails) && orderDetails.length > 0) {
+        // Store old order details for stock comparison
+        oldOrderDetails = JSON.parse(JSON.stringify(existingOrder.orderDetails));
+
         // Validate order details structure
         for (const item of orderDetails) {
           if (!item._id && !item.inventoryId) {
@@ -298,6 +391,25 @@ async fetchOrders(body, tokenDetails) {
             // Update existing item
             const existingItem = existingOrder.orderDetails.id(item._id);
             if (existingItem) {
+              // Check if count changed for stock adjustment (only if order requires stock deduction)
+              if (shouldTrackStock && existingItem.count !== item.count) {
+                const countDiff = item.count - existingItem.count;
+                if (countDiff > 0) {
+                  // Increased quantity - deduct more stock
+                  stockChanges.push({
+                    inventoryId: existingItem.inventoryId.toString(),
+                    quantity: countDiff,
+                    operation: 'decrement'
+                  });
+                } else if (countDiff < 0) {
+                  // Decreased quantity - restore excess stock
+                  stockChanges.push({
+                    inventoryId: existingItem.inventoryId.toString(),
+                    quantity: Math.abs(countDiff),
+                    operation: 'increment'
+                  });
+                }
+              }
               existingItem.count = item.count;
               processedOrderDetails.push(existingItem);
             } else {
@@ -305,13 +417,41 @@ async fetchOrders(body, tokenDetails) {
             }
           } else if (item.inventoryId) {
             // Add new item
-            processedOrderDetails.push({
+            const newItem = {
               productId: item.productId,
               inventoryId: item.inventoryId,
               count: item.count,
               createdAt: new Date(),
               updatedAt: new Date()
-            });
+            };
+            processedOrderDetails.push(newItem);
+
+            // If order requires stock deduction, deduct stock for new item
+            if (shouldTrackStock) {
+              stockChanges.push({
+                inventoryId: item.inventoryId,
+                quantity: item.count,
+                operation: 'decrement'
+              });
+            }
+          }
+        }
+
+        // Find items that were removed
+        const removedItems = oldOrderDetails.filter(oldItem =>
+          !orderDetails.some(newItem => newItem._id && newItem._id.toString() === oldItem._id.toString())
+        );
+
+        // Handle removed items - restore stock if order requires stock deduction
+        if (shouldTrackStock) {
+          for (const removedItem of removedItems) {
+            if (removedItem.inventoryId) {
+              stockChanges.push({
+                inventoryId: removedItem.inventoryId.toString(),
+                quantity: removedItem.count,
+                operation: 'increment'
+              });
+            }
           }
         }
 
@@ -328,7 +468,7 @@ async fetchOrders(body, tokenDetails) {
           updateData.totalDealerPrice = totalCalculated.totalDealerPrice;
           updateData.totalRetailPrice = totalCalculated.totalRetailPrice;
           updateData.totalWholesalePrice = totalCalculated.totalWholesalePrice;
-          updateData.calculatedFare = calculatedAs == "retail" ? totalCalculated.totalRetailPrice : totalCalculated.totalWholesalePrice
+          updateData.calculatedFare = calculatedAs == "retail" ? totalCalculated.totalRetailPrice : totalCalculated.totalWholesalePrice;
         }
       }
 
@@ -344,28 +484,50 @@ async fetchOrders(body, tokenDetails) {
       }
 
       console.log("Update data:", updateData);
+      console.log("Stock changes:", stockChanges);
 
-      // Update the order
-      const updatedOrder = await OrdersModel.findByIdAndUpdate(
-        orderId,
-        {
-          $set: updateData,
-          updatedAt: new Date()
-        },
-        { new: true } // Return the updated document
-      ).populate('orderDetails.productId')
-        .populate('orderDetails.inventoryId')
-        .populate('dealerId');
+      // Execute stock updates in a transaction
+      const session = await mongoose.startSession();
+      session.startTransaction();
 
-      if (!updatedOrder) {
-        throw new Error("Failed to update order");
+      try {
+        // Apply all stock changes
+        for (const change of stockChanges) {
+          await updateStock(change.inventoryId, change.quantity, change.operation);
+        }
+
+        // Update the order
+        const updatedOrder = await OrdersModel.findByIdAndUpdate(
+          orderId,
+          {
+            $set: updateData,
+            updatedAt: new Date()
+          },
+          { new: true, session } // Return the updated document and use transaction
+        ).populate('orderDetails.productId')
+          .populate('orderDetails.inventoryId')
+          .populate('dealerId');
+
+        if (!updatedOrder) {
+          throw new Error("Failed to update order");
+        }
+
+        // Commit transaction
+        await session.commitTransaction();
+        session.endSession();
+
+        return {
+          status: STATUS_SUCCESS,
+          message: "Order updated successfully",
+          data: updatedOrder
+        };
+
+      } catch (error) {
+        // Rollback transaction on error
+        await session.abortTransaction();
+        session.endSession();
+        throw error;
       }
-
-      return {
-        status: STATUS_SUCCESS,
-        message: "Order updated successfully",
-        data: updatedOrder
-      };
 
     } catch (err) {
       console.error("Error updating order:", err);

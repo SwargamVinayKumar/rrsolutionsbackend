@@ -113,10 +113,19 @@ class AuthServices {
       const hasSubscription = Boolean(response?.subscription);
 
       let isActive = false;
+      let daysLeft = 0;
 
       if (hasSubscription) {
         const endDate = new Date(response.subscription.endDate);
-        isActive = endDate > new Date();
+        const now = new Date();
+
+        isActive = endDate > now;
+
+        if (isActive) {
+          daysLeft = Math.ceil(
+            (endDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
+          );
+        }
       }
 
       // ✅ FINAL LOGIC
@@ -133,7 +142,7 @@ class AuthServices {
         message: "Details Fetched Successfully",
         subscriptionRequired,
         approvalStatus: response.approvalStatus,
-        data: response.approvalStatus === "approved" ? response : null
+        data: response.approvalStatus === "approved" ? { ...response, daysLeft } : null
       };
 
     } catch (err) {

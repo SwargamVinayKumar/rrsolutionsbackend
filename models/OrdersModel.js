@@ -10,7 +10,7 @@ const OrderDetails = require('../commonModels/OrderDetails')
 const OrdersModel = new Schema({
     orderStatus: {
         type: String,
-        enum: ["onrequest", "ongoing", "rejected", "completed","returned"],
+        enum: ["onrequest","ongoing",'oncredit',"rejected", "completed","returned"],
         require: true,
         default: "onrequest"
     },
@@ -18,6 +18,10 @@ const OrdersModel = new Schema({
         type: mongoose.Types.ObjectId,
         ref: 'dealers',
         required: true
+    },
+    customerName:{
+        type: String,
+        required: false
     },
     customerMobile:{
         type: String,
