@@ -15,13 +15,15 @@ class ProductServices {
   async createSupplieProduct(body) {
     try {
       const { image, name, bio, metricUnit, quantity, hsnCode } = body
-      const validatorResponse = validator.validate(['name', 'bio', 'metricUnit', 'quantity', 'hsnCode'], body)
+      // image and bio (description) are optional — only the core fields are required
+      const validatorResponse = validator.validate(['name', 'metricUnit', 'quantity', 'hsnCode'], body)
       if (validatorResponse != null) throw validatorResponse
-      console.log(metricUnit)
-      if (!METRIC_UNITS.includes(metricUnit)) throw "Invalid Metric Unit."
+      if (!METRIC_UNITS.includes(metricUnit)) throw "Invalid Metric Unit"
 
       const supplieProductModel = new SupplieProductModel({
-        ...body
+        ...body,
+        image: image || "",
+        bio: bio || ""
       })
       const savedResponse = await supplieProductModel.save()
       return { status: STATUS_SUCCESS, message: "Product Created Successfully", data: savedResponse }
@@ -34,7 +36,8 @@ class ProductServices {
   async updateSupplieProduct(body) {
     try {
       const { docId, image, name, bio, metricUnit, quantity, hsnCode } = body
-      const validatorResponse = validator.validate(['docId', 'name', 'bio', 'metricUnit', 'quantity', 'hsnCode'], body)
+      // image and bio (description) are optional — only the core fields are required
+      const validatorResponse = validator.validate(['docId', 'name', 'metricUnit', 'quantity', 'hsnCode'], body)
       if (validatorResponse != null) throw validatorResponse
       if (!METRIC_UNITS.includes(metricUnit)) throw "Invalid Metric Unit"
       const updateQury = {

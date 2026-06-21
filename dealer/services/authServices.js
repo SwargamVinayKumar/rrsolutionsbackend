@@ -1,4 +1,4 @@
-const { STATUS_SUCCESS, STATUS_FAILED, MEDIA_TYPE } = require('../../config/api')
+const { STATUS_SUCCESS, STATUS_FAILED, MEDIA_TYPE, FREE_TRIAL_DAYS } = require('../../config/api')
 const jwtToken = require('jsonwebtoken')
 const Validator = require('../../extensions/Validator')
 const validator = new Validator();
@@ -57,26 +57,30 @@ class AuthServices {
 
   async signUp(body) {
     try {
-      const { mobile, name, email, password, confirmPassword, businessLogo, businessLicence, businessName, aboutBusiness, location, gstIn, fssaiId } = body;
-      const validatorResponse = validator.validate(['mobile', 'name', 'email', 'password', 'confirmPassword', 'businessLogo', 'businessName', 'aboutBusiness', 'location'], body)
+      const { mobile, name, email, password, confirmPassword, businessName, aboutBusiness, gstIn } = body;
+      const validatorResponse = validator.validate(['mobile', 'name', 'email', 'password', 'confirmPassword', 'businessName', 'aboutBusiness'], body)
       if (validatorResponse != null) throw validatorResponse
 
       if (password != confirmPassword) throw "Password And Confirm Password Should Same";
 
-      const locationValidatorResponse = validator.validate(['address1', 'address2', 'city', 'state', 'landMark', 'pinCode', 'latitude', 'longitude'], body.location)
-      if (locationValidatorResponse != null) throw locationValidatorResponse
-
       const dealerExist = await DealerModel.findOne({ email: email }).select("email approvalStatus").lean();
       if (dealerExist || email == process.env.ADMIN_MAIL) throw "Please Sign In.An Login Exist By This Mail. Or Try With An Other Mail"
 
+      // Auto-approve the dealer and start a free trial immediately on sign-up — no manual steps.
+      const trialStartedAt = new Date();
+      const trialEndsAt = new Date(trialStartedAt.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000);
+
       const dealerModel = new DealerModel({
-        ...body
+        ...body,
+        approvalStatus: "approved",
+        trialStartedAt,
+        trialEndsAt
       });
 
       const savedResponse = await dealerModel.save()
 
 
-      const authToken = await jwtToken.sign({ email: savedResponse?.email, password: savedResponse?.password, id: dealerExist?._id }, secretKey, {
+      const authToken = await jwtToken.sign({ email: savedResponse?.email, password: savedResponse?.password, id: savedResponse?._id }, secretKey, {
         expiresIn: '90 days',
         algorithm: 'HS256'
       });
@@ -84,7 +88,9 @@ class AuthServices {
       return {
         status: STATUS_SUCCESS, message: "Sighned Successfully", data: {
           token: authToken,
-          approvalStatus: "pending"
+          approvalStatus: "approved",
+          onFreeTrial: true,
+          daysLeft: FREE_TRIAL_DAYS
         }
       }
 
@@ -110,39 +116,61 @@ class AuthServices {
 
       const subscriptionConfig = await ExtraModel.findOne({ name: "subscriptions" }).lean();
 
-      const hasSubscription = Boolean(response?.subscription);
+      const now = new Date();
 
-      let isActive = false;
-      let daysLeft = 0;
+      // 1) Active paid subscription?
+      const hasSubscription = Boolean(response?.subscription);
+      let subscriptionActive = false;
+      let subscriptionDaysLeft = 0;
 
       if (hasSubscription) {
         const endDate = new Date(response.subscription.endDate);
-        const now = new Date();
-
-        isActive = endDate > now;
-
-        if (isActive) {
-          daysLeft = Math.ceil(
+        subscriptionActive = endDate > now;
+        if (subscriptionActive) {
+          subscriptionDaysLeft = Math.ceil(
             (endDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
           );
         }
       }
 
-      // ✅ FINAL LOGIC
-      let subscriptionRequired = true;
+      // 2) Free trial still running?
+      let trialActive = false;
+      let trialDaysLeft = 0;
 
-      if (subscriptionConfig?.freeTrial === true) {
-        subscriptionRequired = false;
-      } else if (hasSubscription && isActive) {
+      if (response?.trialEndsAt) {
+        const trialEnd = new Date(response.trialEndsAt);
+        trialActive = trialEnd > now;
+        if (trialActive) {
+          trialDaysLeft = Math.ceil(
+            (trialEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
+          );
+        }
+      }
+
+      // ✅ FINAL LOGIC
+      // The dealer can use the app while either a paid subscription is active,
+      // the free trial is still running, or the admin has enabled a global free trial.
+      const globalFreeTrial = subscriptionConfig?.freeTrial === true;
+      const onFreeTrial = trialActive && !subscriptionActive;
+
+      let subscriptionRequired = true;
+      if (globalFreeTrial || subscriptionActive || trialActive) {
         subscriptionRequired = false;
       }
+
+      // Days left shown in the UI: prefer the paid subscription, otherwise the trial.
+      const daysLeft = subscriptionActive ? subscriptionDaysLeft : trialDaysLeft;
 
       return {
         status: STATUS_SUCCESS,
         message: "Details Fetched Successfully",
         subscriptionRequired,
         approvalStatus: response.approvalStatus,
-        data: response.approvalStatus === "approved" ? { ...response, daysLeft } : null
+        onFreeTrial,
+        daysLeft,
+        data: response.approvalStatus === "approved"
+          ? { ...response, daysLeft, onFreeTrial }
+          : null
       };
 
     } catch (err) {

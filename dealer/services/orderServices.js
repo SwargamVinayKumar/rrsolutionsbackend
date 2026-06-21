@@ -257,18 +257,20 @@ class OrderServices {
         throw new Error(`Invalid calculation type. Must be one of: ${validCalculatedAs.join(', ')}`);
       }
 
-      // Check if order exists
+      // Check if order exists (null-check first to avoid dereferencing null)
       const existingOrder = await OrdersModel.findById(orderId);
-
-      if (existingOrder.orderStatus == "completed" || existingOrder.orderStatus == "rejected" || existingOrder.orderStatus == "returned") {
-        throw "Order status cannot be updated from completed,rejected or returned";
-      }
 
       if (!existingOrder) {
         throw new Error("Order not found");
       }
 
-      // Define statuses that require stock deduction
+      if (existingOrder.orderStatus == "completed" || existingOrder.orderStatus == "rejected" || existingOrder.orderStatus == "returned") {
+        throw "Order status cannot be updated from completed,rejected or returned";
+      }
+
+      // Inventory is deducted once the goods leave the store — i.e. when an
+      // order is Completed (paid) or On Credit (taken now, paid later).
+      // onrequest/ongoing are pre-fulfillment states that don't touch stock.
       const STOCK_DEDUCT_STATUSES = ["completed", "oncredit"];
 
       // Helper function to check if status requires stock deduction
@@ -282,10 +284,10 @@ class OrderServices {
       // Track stock changes for inventory
       let stockChanges = [];
 
-      // Helper function to update stock (to be implemented with transaction)
-      const updateStock = async (inventoryId, quantity, operation) => {
+      // Helper function to update stock within the active transaction session.
+      const updateStock = async (inventoryId, quantity, operation, session) => {
 
-        const inventory = await DealerInventoryModel.findById(inventoryId);
+        const inventory = await DealerInventoryModel.findById(inventoryId).session(session);
         if (!inventory) {
           throw new Error(`Inventory with id ${inventoryId} not found`);
         }
@@ -299,57 +301,25 @@ class OrderServices {
           inventory.stock += quantity;
         }
 
-        await inventory.save();
+        await inventory.save({ session });
         return inventory;
       };
 
       // Get current and new status
       const oldStatus = existingOrder.orderStatus;
       const newStatus = orderStatus || oldStatus;
-      const oldRequiresStock = requiresStockDeduction(oldStatus);
+
+      // Whether stock was ACTUALLY deducted before is taken from the persisted
+      // flag (authoritative), NOT inferred from the old status — this avoids the
+      // bug where legacy oncredit orders (created before oncredit deducted stock)
+      // never got deducted and then a move to completed deducted nothing.
+      const stockAlreadyApplied = existingOrder.stockApplied === true;
       const newRequiresStock = requiresStockDeduction(newStatus);
 
-      console.log(`Status transition: ${oldStatus} (stock: ${oldRequiresStock}) -> ${newStatus} (stock: ${newRequiresStock})`);
+      console.log(`Status transition: ${oldStatus} -> ${newStatus} | stockAlreadyApplied: ${stockAlreadyApplied} | newRequiresStock: ${newRequiresStock}`);
 
-      // Handle stock changes based on status transition
-      if (orderStatus && oldStatus !== newStatus) {
+      if (orderStatus) {
         updateData.orderStatus = orderStatus;
-
-        // Case 1: Moving to stock-deducted status from non-stock-deducted status
-        if (newRequiresStock && !oldRequiresStock) {
-          console.log("Deducting stock - moving to stock-deducted status");
-          // Deduct stock for all items in the order
-          for (const item of existingOrder.orderDetails) {
-            if (item.inventoryId) {
-              stockChanges.push({
-                inventoryId: item.inventoryId.toString(),
-                quantity: item.count,
-                operation: 'decrement'
-              });
-            }
-          }
-        }
-
-        // Case 2: Moving from stock-deducted status to non-stock-deducted status
-        else if (!newRequiresStock && oldRequiresStock) {
-          console.log("Restoring stock - moving from stock-deducted status");
-          // Restore stock for all items
-          for (const item of existingOrder.orderDetails) {
-            if (item.inventoryId) {
-              stockChanges.push({
-                inventoryId: item.inventoryId.toString(),
-                quantity: item.count,
-                operation: 'increment'
-              });
-            }
-          }
-        }
-
-        // Case 3: Moving between stock-deducted statuses (oncredit <-> completed)
-        else if (newRequiresStock && oldRequiresStock) {
-          console.log("No stock change - moving between stock-deducted statuses");
-          // No stock change needed as stock is already deducted
-        }
       }
 
       // Update calculation type if provided
@@ -365,14 +335,26 @@ class OrderServices {
         updateData.customerMobile = customerMobile;
       }
 
-      // Track old items for stock adjustment when items change
-      let oldOrderDetails = [];
-      const shouldTrackStock = requiresStockDeduction(newStatus);
+      // ---------------------------------------------------------------------
+      // Build the FINAL item list first (without touching stock). Then derive
+      // stock changes from a single net-difference model:
+      //   previously-deducted (old items, if old status deducted stock)
+      //   vs now-to-deduct      (final items, if new status deducts stock)
+      // This is the single source of truth for inventory and avoids the bugs
+      // that came from pushing stock changes from multiple places.
+      // ---------------------------------------------------------------------
+
+      // Snapshot the OLD item quantities BEFORE any mutation. We later mutate
+      // existingItem.count in place (mongoose subdocs), which would otherwise
+      // corrupt this baseline and make the net-difference compute to zero.
+      const oldItems = (existingOrder.orderDetails || []).map((item) => ({
+        inventoryId: item.inventoryId ? item.inventoryId.toString() : null,
+        count: item.count || 0
+      }));
+
+      let finalItems; // the order's items after this update
 
       if (orderDetails && Array.isArray(orderDetails) && orderDetails.length > 0) {
-        // Store old order details for stock comparison
-        oldOrderDetails = JSON.parse(JSON.stringify(existingOrder.orderDetails));
-
         // Validate order details structure
         for (const item of orderDetails) {
           if (!item._id && !item.inventoryId) {
@@ -383,33 +365,12 @@ class OrderServices {
           }
         }
 
-        // Process order details - handle both cases: with _id (existing) or new items
         const processedOrderDetails = [];
-
         for (const item of orderDetails) {
           if (item._id) {
             // Update existing item
             const existingItem = existingOrder.orderDetails.id(item._id);
             if (existingItem) {
-              // Check if count changed for stock adjustment (only if order requires stock deduction)
-              if (shouldTrackStock && existingItem.count !== item.count) {
-                const countDiff = item.count - existingItem.count;
-                if (countDiff > 0) {
-                  // Increased quantity - deduct more stock
-                  stockChanges.push({
-                    inventoryId: existingItem.inventoryId.toString(),
-                    quantity: countDiff,
-                    operation: 'decrement'
-                  });
-                } else if (countDiff < 0) {
-                  // Decreased quantity - restore excess stock
-                  stockChanges.push({
-                    inventoryId: existingItem.inventoryId.toString(),
-                    quantity: Math.abs(countDiff),
-                    operation: 'increment'
-                  });
-                }
-              }
               existingItem.count = item.count;
               processedOrderDetails.push(existingItem);
             } else {
@@ -417,60 +378,70 @@ class OrderServices {
             }
           } else if (item.inventoryId) {
             // Add new item
-            const newItem = {
+            processedOrderDetails.push({
               productId: item.productId,
               inventoryId: item.inventoryId,
               count: item.count,
               createdAt: new Date(),
               updatedAt: new Date()
-            };
-            processedOrderDetails.push(newItem);
-
-            // If order requires stock deduction, deduct stock for new item
-            if (shouldTrackStock) {
-              stockChanges.push({
-                inventoryId: item.inventoryId,
-                quantity: item.count,
-                operation: 'decrement'
-              });
-            }
+            });
           }
         }
 
-        // Find items that were removed
-        const removedItems = oldOrderDetails.filter(oldItem =>
-          !orderDetails.some(newItem => newItem._id && newItem._id.toString() === oldItem._id.toString())
-        );
+        updateData.orderDetails = processedOrderDetails;
+        finalItems = processedOrderDetails;
 
-        // Handle removed items - restore stock if order requires stock deduction
-        if (shouldTrackStock) {
-          for (const removedItem of removedItems) {
-            if (removedItem.inventoryId) {
-              stockChanges.push({
-                inventoryId: removedItem.inventoryId.toString(),
-                quantity: removedItem.count,
-                operation: 'increment'
-              });
-            }
-          }
+        // Recalculate totals with updated items
+        const itemsTotal = processedOrderDetails.reduce((total, item) => total + item.count, 0);
+        const totalCalculated = await this.calculateTotals(processedOrderDetails);
+
+        updateData.itemsTotal = itemsTotal;
+        updateData.totalMrpPrice = totalCalculated.totalMrpPrice;
+        updateData.totalDealerPrice = totalCalculated.totalDealerPrice;
+        updateData.totalRetailPrice = totalCalculated.totalRetailPrice;
+        updateData.totalWholesalePrice = totalCalculated.totalWholesalePrice;
+        updateData.calculatedFare = calculatedAs == "retail" ? totalCalculated.totalRetailPrice : totalCalculated.totalWholesalePrice;
+      } else {
+        // Items not being changed — final items are the existing ones.
+        finalItems = oldItems;
+      }
+
+      // Helper: sum counts per inventoryId into a Map.
+      const sumByInventory = (items, shouldCount) => {
+        const map = new Map();
+        if (!shouldCount) return map;
+        for (const item of items) {
+          if (!item.inventoryId) continue;
+          const key = item.inventoryId.toString();
+          map.set(key, (map.get(key) || 0) + (item.count || 0));
         }
+        return map;
+      };
 
-        // If we're replacing all order details
-        if (orderDetails.length === processedOrderDetails.length) {
-          updateData.orderDetails = processedOrderDetails;
+      // What was ACTUALLY deducted before (based on the persisted flag, using the
+      // old item quantities) vs what should be deducted now (final items, only if
+      // the new status deducts stock).
+      const previouslyDeducted = sumByInventory(oldItems, stockAlreadyApplied);
+      const toDeductNow = sumByInventory(finalItems, newRequiresStock);
 
-          // Recalculate totals with updated items
-          const itemsTotal = processedOrderDetails.reduce((total, item) => total + item.count, 0);
-          const totalCalculated = await this.calculateTotals(processedOrderDetails);
+      // Net difference per inventoryId → a single decrement/increment each.
+      const allInventoryIds = new Set([
+        ...previouslyDeducted.keys(),
+        ...toDeductNow.keys()
+      ]);
 
-          updateData.itemsTotal = itemsTotal;
-          updateData.totalMrpPrice = totalCalculated.totalMrpPrice;
-          updateData.totalDealerPrice = totalCalculated.totalDealerPrice;
-          updateData.totalRetailPrice = totalCalculated.totalRetailPrice;
-          updateData.totalWholesalePrice = totalCalculated.totalWholesalePrice;
-          updateData.calculatedFare = calculatedAs == "retail" ? totalCalculated.totalRetailPrice : totalCalculated.totalWholesalePrice;
+      for (const inventoryId of allInventoryIds) {
+        const diff = (toDeductNow.get(inventoryId) || 0) - (previouslyDeducted.get(inventoryId) || 0);
+        if (diff > 0) {
+          stockChanges.push({ inventoryId, quantity: diff, operation: 'decrement' });
+        } else if (diff < 0) {
+          stockChanges.push({ inventoryId, quantity: Math.abs(diff), operation: 'increment' });
         }
       }
+
+      // Persist whether stock is now applied so future updates compute the net
+      // difference correctly regardless of status history.
+      updateData.stockApplied = newRequiresStock;
 
       // Update payments if provided
       if (payments && Array.isArray(payments)) {
@@ -491,9 +462,9 @@ class OrderServices {
       session.startTransaction();
 
       try {
-        // Apply all stock changes
+        // Apply all stock changes within the transaction session
         for (const change of stockChanges) {
-          await updateStock(change.inventoryId, change.quantity, change.operation);
+          await updateStock(change.inventoryId, change.quantity, change.operation, session);
         }
 
         // Update the order

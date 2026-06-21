@@ -93,6 +93,8 @@ class ProductServices {
             return {
               ...item,
               inventoryInfo: inventoryInfo ? {
+                _id: inventoryInfo._id,
+                productId: inventoryInfo.productId,
                 mrp: inventoryInfo.mrp,
                 wholesalePrice: inventoryInfo.wholesalePrice,
                 retailPrice: inventoryInfo.retailPrice,

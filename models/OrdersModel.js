@@ -74,6 +74,14 @@ const OrdersModel = new Schema({
     calculatedFare:{
         type: Number,
         require: true
+    },
+    // Authoritative record of whether this order's items have actually been
+    // deducted from inventory. Do NOT infer this from orderStatus — legacy
+    // orders and orders created via other flows may not match.
+    stockApplied: {
+        type: Boolean,
+        required: false,
+        default: false
     }
 }, { versionKey: false, timestamps: true })
 

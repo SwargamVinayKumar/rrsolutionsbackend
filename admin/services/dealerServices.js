@@ -73,6 +73,101 @@ class DealerServices {
     }
   }
 
+  async fetchTrialDealers(body) {
+    try {
+      const { limit = 10, currentPage = 1, search = "" } = body;
+      const validatorResponse = validator.validate(['limit', 'currentPage'], body)
+      if (validatorResponse != null) throw validatorResponse
+
+      const now = new Date();
+      const escapedSearch = validator.escapeRegex(search);
+
+      // A "trial dealer" is one with no active paid subscription whose trial window is set.
+      // We surface all dealers that have a trialEndsAt, computing days left per dealer.
+      // Rejected dealers are excluded from the trial list.
+      const baseQuery = {
+        trialEndsAt: { $ne: null },
+        approvalStatus: { $ne: "rejected" },
+        $or: [
+          { subscription: null },
+          { subscription: { $exists: false } }
+        ]
+      };
+
+      const findQuery = search == null || search === "" ? baseQuery : {
+        $and: [
+          baseQuery,
+          {
+            $or: [
+              { "name": { $regex: escapedSearch, $options: "i" } },
+              { "businessName": { $regex: escapedSearch, $options: "i" } },
+              { "email": { $regex: escapedSearch, $options: "i" } },
+              {
+                $expr: {
+                  $regexMatch: {
+                    input: { $toString: "$mobile" },
+                    regex: escapedSearch,
+                    options: "i"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      };
+
+      const docCount = await DealerModel.countDocuments(findQuery);
+      const skip = (currentPage - 1) * limit;
+      const pageCount = docCount % limit === 0 ? docCount / limit : Math.floor(docCount / limit) + 1;
+
+      const dealers = await DealerModel.find(findQuery)
+        .select({ name: true, businessName: true, email: true, mobile: true, approvalStatus: true, trialStartedAt: true, trialEndsAt: true, createdAt: true })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean();
+
+      const withTrialInfo = dealers.map(dealer => {
+        const trialEnd = dealer.trialEndsAt ? new Date(dealer.trialEndsAt) : null;
+        const trialActive = trialEnd ? trialEnd > now : false;
+        const daysLeft = trialActive
+          ? Math.ceil((trialEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+          : 0;
+        return { ...dealer, trialActive, daysLeft };
+      });
+
+      return {
+        status: STATUS_SUCCESS, message: "Trial Dealers Fetched Successfully", data: {
+          pageCount,
+          dealers: withTrialInfo
+        }
+      }
+    }
+    catch (err) {
+      return { status: STATUS_FAILED, message: err + "" }
+    }
+  }
+
+  async fetchTrialDealersCount() {
+    try {
+      const now = new Date();
+      // Count dealers whose trial is currently active and who have no paid subscription.
+      // Rejected dealers are excluded.
+      const activeTrialCount = await DealerModel.countDocuments({
+        trialEndsAt: { $gt: now },
+        approvalStatus: { $ne: "rejected" },
+        $or: [
+          { subscription: null },
+          { subscription: { $exists: false } }
+        ]
+      });
+      return { status: STATUS_SUCCESS, message: "Trial Dealers Count Fetched Successfully", data: { count: activeTrialCount } }
+    }
+    catch (err) {
+      return { status: STATUS_FAILED, message: err + "" }
+    }
+  }
+
   async fetchDealerDetails(body) {
     try {
       const { dealerId } = body

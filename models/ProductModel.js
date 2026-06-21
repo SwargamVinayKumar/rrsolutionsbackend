@@ -5,7 +5,8 @@ const Schema = mongoose.Schema
 const ProductModel = new Schema({
     image:{
         type:String,
-        require:true        
+        required:false,
+        default:""
     },
     name:{
         type:String,
@@ -13,7 +14,8 @@ const ProductModel = new Schema({
     },
     bio:{
         type:String,
-        require:true
+        required:false,
+        default:""
     },
     metricUnit:{
         type:String,

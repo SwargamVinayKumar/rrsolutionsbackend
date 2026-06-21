@@ -76,6 +76,14 @@ const DealerModel  = new Schema({
         ref: "subscriptions",
         required: false
     },
+    trialStartedAt: {
+        type: Date,
+        required: false
+    },
+    trialEndsAt: {
+        type: Date,
+        required: false
+    },
 },{ versionKey: false, timestamps: true })
 
 module.exports = mongoose.model('dealers',DealerModel)

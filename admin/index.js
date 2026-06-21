@@ -102,6 +102,16 @@ router.post('/fetchDealerStats',middleWear.validateAdmin,async ({ body },res) =>
     res.send(response)
 })
 
+router.post('/fetchTrialDealers',middleWear.validateAdmin,async ({ body },res) => {
+    const response = await dealerServices.fetchTrialDealers(body)
+    res.send(response)
+})
+
+router.post('/fetchTrialDealersCount',middleWear.validateAdmin,async (req,res) => {
+    const response = await dealerServices.fetchTrialDealersCount()
+    res.send(response)
+})
+
 router.post('/fetchInventoryProducts',middleWear.validateAdmin,async ({ body,tokenDetails},res) => {
     const response = await dealerServices.fetchInventoryProducts(body,tokenDetails)
     res.send(response)
