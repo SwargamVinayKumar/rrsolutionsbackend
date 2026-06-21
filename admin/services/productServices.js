@@ -15,9 +15,10 @@ class ProductServices {
   async createSupplieProduct(body) {
     try {
       const { image, name, bio, metricUnit, quantity, hsnCode } = body
-      const validatorResponse = validator.validate(['image', 'name', 'bio', 'metricUnit', 'quantity', 'hsnCode'], body)
+      const validatorResponse = validator.validate(['name', 'bio', 'metricUnit', 'quantity', 'hsnCode'], body)
       if (validatorResponse != null) throw validatorResponse
-      if (!METRIC_UNITS.includes(metricUnit)) throw "Invalid Metric Unit"
+      console.log(metricUnit)
+      if (!METRIC_UNITS.includes(metricUnit)) throw "Invalid Metric Unit."
 
       const supplieProductModel = new SupplieProductModel({
         ...body
@@ -33,7 +34,7 @@ class ProductServices {
   async updateSupplieProduct(body) {
     try {
       const { docId, image, name, bio, metricUnit, quantity, hsnCode } = body
-      const validatorResponse = validator.validate(['docId', 'image', 'name', 'bio', 'metricUnit', 'quantity', 'hsnCode'], body)
+      const validatorResponse = validator.validate(['docId', 'name', 'bio', 'metricUnit', 'quantity', 'hsnCode'], body)
       if (validatorResponse != null) throw validatorResponse
       if (!METRIC_UNITS.includes(metricUnit)) throw "Invalid Metric Unit"
       const updateQury = {

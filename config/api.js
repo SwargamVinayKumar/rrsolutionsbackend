@@ -24,7 +24,6 @@ const METRIC_UNITS = [
   "square meter", "square meters",
   "cubic meter", "cubic meters",
   "cubic foot", "cubic feet",
-
   "roll", "rolls",
   "bag", "bags",
   "bag (bulk)", "bags (bulk)",
@@ -49,27 +48,21 @@ const METRIC_UNITS = [
   "sheet", "sheets",
   "table", "tables",
   "trolley", "trolleys",
-
   "foot", "feet",
   "yard", "yards",
   "fathom", "fathoms",
-
   "gallon", "gallons",
   "litre", "litres",
-
   "hour", "hours",
   "day", "days",
-
   "number", "numbers",
   "quintal", "quintals",
   "tonne", "tonnes",
   "metric ton", "metric tons",
   "air freight ton", "air freight tons",
-
   "ampere", "amperes",
   "amplitude", "amplitudes",
   "barometric", "barometric units",
-
   "indian rupee", "indian rupees"
 ];
 
